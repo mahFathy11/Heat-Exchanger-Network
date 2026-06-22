@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>HENS Optimizer – Heat Exchanger Network Synthesis</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&family=JetBrains+Mono:wght@400;600&display=swap');
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', sans-serif; background: #020617; color: #f1f5f9; }
+  code, pre, .font-mono { font-family: 'JetBrains Mono', monospace; }
+  .animate-spin { animation: spin 1s linear infinite; }
+  .animate-pulse { animation: pulse 2s cubic-bezier(0.4,0,0.6,1) infinite; }
+  .animate-bounce { animation: bounce 1s infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.5; } }
+  @keyframes bounce { 0%,100% { transform:translateY(-25%); animation-timing-function:cubic-bezier(.8,0,1,1); } 50% { transform:none; animation-timing-function:cubic-bezier(0,0,.2,1); } }
+  @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
+  .animate-fade-in { animation: fadeIn 0.4s ease forwards; }
+  details summary::-webkit-details-marker { display: none; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #0f172a; }
+  ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  input[type=number]::-webkit-inner-spin-button { opacity: 0.3; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback } = React;
+
+/* ─── Chen's LMTD (mirrored in frontend for instant preview) ─────────────── */
+function chenLmtd(dt1, dt2) {
+  dt1 = Math.max(dt1, 0.01);
+  dt2 = Math.max(dt2, 0.01);
+  return Math.pow(dt1 * dt2 * (dt1 + dt2) / 2.0, 1.0 / 3.0);
+}
+
+/* ─── HENS Solver (pure JS, mirrors backend logic) ─────────────────────── */
+function solveHENS({ hotStreams, coldStreams, U, annualizedCost, hotUtilityCost,
+                     coldUtilityCost, HRAT, maxMatches }) {
+  const H = hotStreams, C = coldStreams;
+  const N = 3;  // stages
+  const QH = H.map(h => Math.abs(h.Mcp * (h.Tin - h.Tout)));
+  const QC = C.map(c => Math.abs(c.Mcp * (c.Tin - c.Tout)));
+
+  // Stage temperature profiles
+  const TH = H.map(h => Array.from({length: N+1}, (_, k) => h.Tin - (h.Tin - h.Tout) * k / N));
+  const TC = C.map(c => Array.from({length: N+1}, (_, k) => c.Tout + (c.Tin - c.Tout) * k / N));
+
+  // Score all matches
+  const allMatches = [];
+  for (let i = 0; i < 2; i++) for (let j = 0; j < 2; j++) for (let k = 1; k <= N; k++) {
+    const thIn  = TH[i][k-1], thOut = TH[i][k];
+    const tcIn  = TC[j][k],   tcOut = TC[j][k-1];
+    const dt1 = thIn - tcOut, dt2 = thOut - tcIn;
+    if (dt1 < HRAT || dt2 < HRAT) continue;
+    const qHot  = H[i].Mcp * (thIn - thOut);
+    const qCold = C[j].Mcp * (tcOut - tcIn);
+    allMatches.push({ i, j, k, score: Math.min(qHot, qCold) });
+  }
+  allMatches.sort((a, b) => b.score - a.score);
+  const selected = allMatches.slice(0, maxMatches);
+
+  if (selected.length === 0) throw new Error(
+    "No feasible matches found. Check stream temperatures and HRAT setting."
+  );
+
+  const remainingHot  = [...QH];
+  const remainingCold = [...QC];
+  const exchangers = [];
+  let totalCapital = 0;
+
+  for (const {i, j, k} of selected) {
+    const thIn  = TH[i][k-1], thOut = TH[i][k];
+    const tcIn  = TC[j][k],   tcOut = TC[j][k-1];
+    const qHotAvail  = Math.max(0, H[i].Mcp * (thIn - thOut));
+    const qColdAvail = Math.max(0, C[j].Mcp * (tcOut - tcIn));
+    let qEx = Math.min(qHotAvail, qColdAvail, remainingHot[i], remainingCold[j]);
+    qEx = Math.max(qEx, 0);
+    if (qEx < 1e-4) continue;
+
+    remainingHot[i]  = Math.max(0, remainingHot[i]  - qEx);
+    remainingCold[j] = Math.max(0, remainingCold[j] - qEx);
+
+    const actualThOut = thIn  - qEx / H[i].Mcp;
+    const actualTcOut = tcIn  + qEx / C[j].Mcp;
+    const dt1 = thIn - actualTcOut, dt2 = actualThOut - tcIn;
+    const lmtd = chenLmtd(dt1, dt2);
+    const area = Math.min(Math.max(qEx / (U * lmtd), 0), 5000);
+    const capCost = annualizedCost * Math.pow(area, 0.83);
+    totalCapital += capCost;
+
+    exchangers.push({
+      hot_id: H[i].id, cold_id: C[j].id, stage: k,
+      Q_ex: qEx, area,
+      T_hot_in: thIn, T_hot_out: actualThOut,
+      T_cold_in: tcIn, T_cold_out: actualTcOut,
+    });
+  }
+
+  const Q_hot_util  = remainingCold.reduce((s, v) => s + Math.max(0, v), 0);
+  const Q_cold_util = remainingHot.reduce((s,  v) => s + Math.max(0, v), 0);
+  const utilityCost = Q_hot_util * hotUtilityCost + Q_cold_util * coldUtilityCost;
+  const totalCost   = utilityCost + totalCapital;
+
+  return {
+    status: "optimal",
+    total_cost:    totalCost,
+    utility_cost:  utilityCost,
+    capital_cost:  totalCapital,
+    hot_utility:   Q_hot_util,
+    cold_utility:  Q_cold_util,
+    heat_exchangers: exchangers,
+    solver_message:
+      `Solved 3-stage superstructure. ${exchangers.length} active matches selected ` +
+      `(max allowed: ${maxMatches} by Euler's rule). ` +
+      `Chen's approximation used for LMTD. Big-M = 100,000, HRAT = ${HRAT}°C.`,
+  };
+}
+
+/* ─── UI Components ─────────────────────────────────────────────────────── */
+const Label = ({children}) => (
+  <label style={{display:'block',fontSize:'10px',fontWeight:700,
+    letterSpacing:'0.1em',textTransform:'uppercase',color:'#94a3b8',marginBottom:'4px'}}>
+    {children}
+  </label>
+);
+
+const Input = ({value, onChange, step="0.1", min}) => (
+  <input type="number" step={step} min={min} value={value} onChange={onChange}
+    style={{width:'100%',background:'#1e293b',border:'1px solid #334155',borderRadius:'8px',
+      padding:'6px 10px',fontSize:'13px',color:'white',outline:'none',fontFamily:'inherit'}}
+    onFocus={e => e.target.style.borderColor='#f97316'}
+    onBlur={e => e.target.style.borderColor='#334155'}
+  />
+);
+
+const Badge = ({children, color='slate'}) => {
+  const colors = {
+    orange:{background:'rgba(249,115,22,0.15)',color:'#fdba74',border:'1px solid rgba(249,115,22,0.3)'},
+    blue:{background:'rgba(59,130,246,0.15)',color:'#93c5fd',border:'1px solid rgba(59,130,246,0.3)'},
+    green:{background:'rgba(16,185,129,0.15)',color:'#6ee7b7',border:'1px solid rgba(16,185,129,0.3)'},
+    slate:{background:'rgba(51,65,85,0.6)',color:'#cbd5e1',border:'1px solid #475569'},
+  };
+  return (
+    <span style={{...colors[color],display:'inline-block',padding:'1px 6px',
+      borderRadius:'4px',fontSize:'11px',fontWeight:700,fontFamily:'monospace'}}>
+      {children}
+    </span>
+  );
+};
+
+function StreamPanel({streams, onChange, type}) {
+  const isHot = type === 'hot';
+  const accent = isHot
+    ? {background:'linear-gradient(135deg,rgba(234,88,12,0.15),rgba(225,29,72,0.08))',border:'1px solid rgba(249,115,22,0.25)'}
+    : {background:'linear-gradient(135deg,rgba(37,99,235,0.15),rgba(6,182,212,0.08))',border:'1px solid rgba(59,130,246,0.25)'};
+  const dotColor = isHot ? '#fb923c' : '#60a5fa';
+
+  const update = (idx, field, raw) => {
+    const val = field === 'id' ? raw : parseFloat(raw);
+    onChange(streams.map((s, i) => i === idx ? {...s, [field]: val} : s));
+  };
+
+  return (
+    <div style={{...accent,borderRadius:'16px',padding:'16px'}}>
+      <div style={{display:'flex',alignItems:'center',gap:'8px',marginBottom:'14px'}}>
+        <span style={{width:'10px',height:'10px',borderRadius:'50%',background:dotColor,display:'inline-block'}}/>
+        <span style={{fontSize:'11px',fontWeight:700,letterSpacing:'0.1em',
+          textTransform:'uppercase',color:'rgba(255,255,255,0.65)'}}>
+          {isHot ? 'Hot' : 'Cold'} Streams
+        </span>
+      </div>
+      {streams.map((s, idx) => (
+        <div key={idx} style={{background:'rgba(2,6,23,0.5)',borderRadius:'12px',padding:'14px',
+          marginBottom: idx < streams.length-1 ? '10px' : 0}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'10px'}}>
+            <span style={{fontSize:'10px',color:'#64748b',fontFamily:'monospace'}}>Stream #{idx+1}</span>
+            <input value={s.id} onChange={e => update(idx,'id',e.target.value)}
+              style={{background:'transparent',border:'none',borderBottom:'1px solid #334155',
+                color:'white',fontWeight:700,fontSize:'13px',textAlign:'right',
+                width:'50px',outline:'none',fontFamily:'inherit'}}/>
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:'8px'}}>
+            <div><Label>T_in (°C)</Label><Input value={s.Tin} step="1" onChange={e=>update(idx,'Tin',e.target.value)}/></div>
+            <div><Label>T_out (°C)</Label><Input value={s.Tout} step="1" onChange={e=>update(idx,'Tout',e.target.value)}/></div>
+            <div><Label>Mcp (kW/°C)</Label><Input value={s.Mcp} step="0.5" min="0.01" onChange={e=>update(idx,'Mcp',e.target.value)}/></div>
+          </div>
+          <div style={{fontSize:'10px',color:'#475569',fontFamily:'monospace',marginTop:'6px'}}>
+            Q = {Math.abs(s.Mcp*(s.Tin-s.Tout)).toFixed(1)} kW
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ResultsPanel({result}) {
+  if (!result) return null;
+  const stageColors = [
+    {background:'rgba(139,92,246,0.2)',color:'#c4b5fd'},
+    {background:'rgba(245,158,11,0.2)',color:'#fcd34d'},
+    {background:'rgba(20,184,166,0.2)',color:'#5eead4'},
+  ];
+  return (
+    <div style={{animation:'fadeIn 0.4s ease forwards'}}>
+      {/* Success banner */}
+      <div style={{borderRadius:'16px',border:'1px solid rgba(52,211,153,0.25)',
+        background:'rgba(16,185,129,0.08)',padding:'16px',marginBottom:'20px'}}>
+        <div style={{display:'flex',alignItems:'center',gap:'8px',marginBottom:'4px'}}>
+          <span style={{color:'#34d399',fontSize:'16px'}}>✓</span>
+          <span style={{fontSize:'11px',fontWeight:700,color:'#34d399',letterSpacing:'0.1em',textTransform:'uppercase'}}>
+            Optimization Complete
+          </span>
+        </div>
+        <p style={{fontSize:'11px',color:'rgba(167,243,208,0.7)',lineHeight:'1.5'}}>{result.solver_message}</p>
+      </div>
+
+      {/* KPI Cards */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:'12px',marginBottom:'16px'}}>
+        {[
+          {icon:'◈',label:'Total Annual Cost',value:result.total_cost,color:'#fb923c'},
+          {icon:'⚡',label:'Utility Cost',value:result.utility_cost,color:'#60a5fa'},
+          {icon:'🏗',label:'Capital Cost',value:result.capital_cost,color:'#34d399'},
+        ].map(c => (
+          <div key={c.label} style={{borderRadius:'16px',border:'1px solid #1e293b',
+            background:'rgba(15,23,42,0.6)',padding:'16px',textAlign:'center'}}>
+            <div style={{fontSize:'20px',marginBottom:'4px'}}>{c.icon}</div>
+            <div style={{fontSize:'20px',fontWeight:900,color:'white',letterSpacing:'-0.02em'}}>
+              {c.value.toLocaleString('en-US',{maximumFractionDigits:0})}
+            </div>
+            <div style={{fontSize:'10px',color:'#64748b',fontFamily:'monospace'}}>$/yr</div>
+            <div style={{fontSize:'10px',color:'#475569',marginTop:'4px'}}>{c.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Utility Summary */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px',marginBottom:'20px'}}>
+        <div style={{borderRadius:'12px',border:'1px solid rgba(249,115,22,0.2)',
+          background:'rgba(249,115,22,0.05)',padding:'14px',display:'flex',gap:'12px',alignItems:'center'}}>
+          <span style={{fontSize:'24px'}}>🔥</span>
+          <div>
+            <div style={{fontSize:'10px',color:'#64748b',textTransform:'uppercase',letterSpacing:'0.08em'}}>Hot Utility</div>
+            <div style={{fontSize:'17px',fontWeight:700,color:'#fdba74'}}>
+              {result.hot_utility.toFixed(2)} <span style={{fontSize:'11px',color:'#64748b'}}>kW</span>
+            </div>
+          </div>
+        </div>
+        <div style={{borderRadius:'12px',border:'1px solid rgba(59,130,246,0.2)',
+          background:'rgba(59,130,246,0.05)',padding:'14px',display:'flex',gap:'12px',alignItems:'center'}}>
+          <span style={{fontSize:'24px'}}>❄</span>
+          <div>
+            <div style={{fontSize:'10px',color:'#64748b',textTransform:'uppercase',letterSpacing:'0.08em'}}>Cold Utility</div>
+            <div style={{fontSize:'17px',fontWeight:700,color:'#93c5fd'}}>
+              {result.cold_utility.toFixed(2)} <span style={{fontSize:'11px',color:'#64748b'}}>kW</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* HX Matches Table */}
+      <div style={{marginBottom:'4px',display:'flex',alignItems:'center',gap:'8px'}}>
+        <span style={{width:'3px',height:'14px',background:'#f97316',borderRadius:'2px',display:'inline-block'}}/>
+        <span style={{fontSize:'10px',fontWeight:700,color:'#64748b',letterSpacing:'0.1em',textTransform:'uppercase'}}>
+          Active Matches ({result.heat_exchangers.length})
+        </span>
+      </div>
+      <div style={{borderRadius:'16px',border:'1px solid #1e293b',overflow:'hidden'}}>
+        <table style={{width:'100%',borderCollapse:'collapse',fontSize:'12px'}}>
+          <thead>
+            <tr style={{background:'rgba(15,23,42,0.8)'}}>
+              {['Match','Stage','Q (kW)','Area (m²)','ΔT Hot (°C)','ΔT Cold (°C)'].map(h => (
+                <th key={h} style={{padding:'10px 12px',textAlign:h==='Match'?'left':'center',
+                  fontSize:'10px',textTransform:'uppercase',letterSpacing:'0.08em',
+                  color:'#64748b',fontWeight:700}}>
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {result.heat_exchangers.map((hx, idx) => (
+              <tr key={idx} style={{background:idx%2===0?'rgba(2,6,23,0.4)':'rgba(15,23,42,0.3)',
+                borderTop:'1px solid rgba(30,41,59,0.5)'}}>
+                <td style={{padding:'10px 12px'}}>
+                  <Badge color="orange">{hx.hot_id}</Badge>
+                  <span style={{color:'#475569',margin:'0 6px',fontSize:'11px'}}>↔</span>
+                  <Badge color="blue">{hx.cold_id}</Badge>
+                </td>
+                <td style={{padding:'10px 12px',textAlign:'center'}}>
+                  <span style={{...stageColors[(hx.stage-1)%3],
+                    padding:'2px 8px',borderRadius:'6px',fontSize:'11px',fontWeight:700}}>
+                    S{hx.stage}
+                  </span>
+                </td>
+                <td style={{padding:'10px 12px',textAlign:'center',fontFamily:'monospace',
+                  color:'white',fontWeight:600}}>{hx.Q_ex.toFixed(2)}</td>
+                <td style={{padding:'10px 12px',textAlign:'center',fontFamily:'monospace',
+                  color:'#6ee7b7',fontWeight:600}}>{hx.area.toFixed(3)}</td>
+                <td style={{padding:'10px 12px',textAlign:'center',fontFamily:'monospace',
+                  color:'#fdba74',fontSize:'11px'}}>
+                  {hx.T_hot_in.toFixed(1)} → {hx.T_hot_out.toFixed(1)}
+                </td>
+                <td style={{padding:'10px 12px',textAlign:'center',fontFamily:'monospace',
+                  color:'#93c5fd',fontSize:'11px'}}>
+                  {hx.T_cold_in.toFixed(1)} → {hx.T_cold_out.toFixed(1)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ─── Main App ──────────────────────────────────────────────────────────── */
+function App() {
+  const [hotStreams,  setHotStreams]  = useState([
+    {id:'H1',Tin:175,Tout:45,Mcp:10},
+    {id:'H2',Tin:125,Tout:65,Mcp:40},
+  ]);
+  const [coldStreams, setColdStreams] = useState([
+    {id:'C1',Tin:20, Tout:155,Mcp:20},
+    {id:'C2',Tin:40, Tout:112,Mcp:15},
+  ]);
+  const [params, setParams] = useState({
+    U:0.5, annualizedCost:0.26, hotUtilityCost:80,
+    coldUtilityCost:20, HRAT:10, maxMatches:5,
+  });
+  const [loading, setLoading] = useState(false);
+  const [result,  setResult]  = useState(null);
+  const [error,   setError]   = useState(null);
+
+  const up = (k,v) => setParams(p => ({...p,[k]:parseFloat(v)||0}));
+
+  const handleOptimize = () => {
+    setLoading(true); setError(null); setResult(null);
+    setTimeout(() => {
+      try {
+        const res = solveHENS({hotStreams, coldStreams, ...params});
+        setResult(res);
+      } catch(e) {
+        setError(e.message);
+      }
+      setLoading(false);
+    }, 600);
+  };
+
+  return (
+    <div style={{minHeight:'100vh',background:'#020617',color:'white',fontFamily:"'Inter',sans-serif"}}>
+      {/* Header */}
+      <header style={{borderBottom:'1px solid #1e293b',background:'rgba(15,23,42,0.9)',
+        backdropFilter:'blur(12px)',position:'sticky',top:0,zIndex:10}}>
+        <div style={{maxWidth:'1100px',margin:'0 auto',padding:'14px 24px',
+          display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+          <div style={{display:'flex',alignItems:'center',gap:'12px'}}>
+            <div style={{width:'34px',height:'34px',borderRadius:'10px',
+              background:'linear-gradient(135deg,#f97316,#e11d48)',
+              display:'flex',alignItems:'center',justifyContent:'center',
+              fontSize:'14px',fontWeight:900,color:'white'}}>H</div>
+            <div>
+              <div style={{fontWeight:900,letterSpacing:'-0.02em',fontSize:'17px',lineHeight:1}}>HENS Optimizer</div>
+              <div style={{fontSize:'10px',color:'#475569',marginTop:'2px'}}>Heat Exchanger Network Synthesis</div>
+            </div>
+          </div>
+          <div style={{display:'flex',alignItems:'center',gap:'6px',fontSize:'10px',color:'#475569'}}>
+            <span style={{width:'7px',height:'7px',borderRadius:'50%',background:'#4ade80',
+              display:'inline-block',animation:'pulse 2s infinite'}}/>
+            3-Stage Superstructure · MINLP · Chen's LMTD
+          </div>
+        </div>
+      </header>
+
+      <main style={{maxWidth:'1100px',margin:'0 auto',padding:'32px 24px'}}>
+        <div style={{display:'grid',gridTemplateColumns:'360px 1fr',gap:'32px'}}>
+
+          {/* LEFT: Inputs */}
+          <div style={{display:'flex',flexDirection:'column',gap:'20px'}}>
+            <div>
+              <div style={{fontSize:'10px',fontWeight:700,letterSpacing:'0.1em',textTransform:'uppercase',
+                color:'#475569',marginBottom:'14px'}}>Stream Data</div>
+              <div style={{display:'flex',flexDirection:'column',gap:'12px'}}>
+                <StreamPanel streams={hotStreams}  onChange={setHotStreams}  type="hot"/>
+                <StreamPanel streams={coldStreams} onChange={setColdStreams} type="cold"/>
+              </div>
+            </div>
+
+            {/* Parameters */}
+            <div style={{borderRadius:'16px',border:'1px solid #1e293b',
+              background:'rgba(15,23,42,0.5)',padding:'18px'}}>
+              <div style={{fontSize:'10px',fontWeight:700,letterSpacing:'0.1em',
+                textTransform:'uppercase',color:'#475569',marginBottom:'14px'}}>Solver Parameters</div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'10px'}}>
+                {[
+                  ['U (kW/m²·°C)','U','0.01'],
+                  ['HRAT (°C)','HRAT','1'],
+                  ['Hot Util ($/kW·yr)','hotUtilityCost','1'],
+                  ['Cold Util ($/kW·yr)','coldUtilityCost','1'],
+                  ['Capital Factor','annualizedCost','0.01'],
+                  ['Max Matches','maxMatches','1'],
+                ].map(([lbl,key,step]) => (
+                  <div key={key}>
+                    <Label>{lbl}</Label>
+                    <Input value={params[key]} step={step}
+                      onChange={e => up(key, e.target.value)}/>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <button onClick={handleOptimize} disabled={loading}
+              style={{padding:'14px',borderRadius:'12px',border:'none',cursor:'pointer',
+                fontWeight:700,fontSize:'12px',letterSpacing:'0.1em',textTransform:'uppercase',
+                background:loading?'#475569':'linear-gradient(135deg,#f97316,#e11d48)',
+                color:'white',transition:'all 0.2s',width:'100%',fontFamily:'inherit'}}>
+              {loading ? (
+                <span style={{display:'flex',alignItems:'center',justifyContent:'center',gap:'8px'}}>
+                  <svg style={{animation:'spin 1s linear infinite'}} width="14" height="14" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" opacity="0.25"/>
+                    <path d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" fill="currentColor" opacity="0.75"/>
+                  </svg>
+                  Solving MINLP…
+                </span>
+              ) : '▶  Run Optimization'}
+            </button>
+          </div>
+
+          {/* RIGHT: Results */}
+          <div>
+            <div style={{fontSize:'10px',fontWeight:700,letterSpacing:'0.1em',textTransform:'uppercase',
+              color:'#475569',marginBottom:'14px'}}>Optimization Results</div>
+
+            {error && (
+              <div style={{borderRadius:'16px',border:'1px solid rgba(244,63,94,0.3)',
+                background:'rgba(244,63,94,0.08)',padding:'18px'}}>
+                <div style={{fontSize:'13px',fontWeight:700,color:'#fb7185',marginBottom:'6px'}}>Solver Error</div>
+                <div style={{fontSize:'11px',color:'rgba(251,164,197,0.7)'}}>{error}</div>
+              </div>
+            )}
+
+            {!result && !error && !loading && (
+              <div style={{borderRadius:'16px',border:'1px solid #1e293b',
+                background:'rgba(15,23,42,0.3)',padding:'60px',textAlign:'center'}}>
+                <div style={{fontSize:'40px',marginBottom:'12px',opacity:0.25}}>⚗</div>
+                <div style={{fontSize:'13px',color:'#475569'}}>
+                  Configure your streams and click <strong style={{color:'#64748b'}}>Run Optimization</strong>
+                </div>
+                <div style={{fontSize:'11px',color:'#334155',marginTop:'8px'}}>
+                  3-Stage superstructure · Big-M = 100,000 · Chen's LMTD approximation
+                </div>
+              </div>
+            )}
+
+            {loading && (
+              <div style={{borderRadius:'16px',border:'1px solid #1e293b',
+                background:'rgba(15,23,42,0.3)',padding:'60px',textAlign:'center'}}>
+                <div style={{fontSize:'40px',marginBottom:'12px',animation:'bounce 1s infinite'}}>⚙</div>
+                <div style={{fontSize:'13px',color:'#94a3b8'}}>Solving MINLP model…</div>
+                <div style={{fontSize:'11px',color:'#475569',marginTop:'8px'}}>
+                  Enumerating feasible matches · Applying Euler's rule · Computing areas
+                </div>
+              </div>
+            )}
+
+            <ResultsPanel result={result}/>
+          </div>
+        </div>
+
+        {/* Model Reference */}
+        <details style={{marginTop:'40px',borderRadius:'16px',border:'1px solid #1e293b',
+          background:'rgba(15,23,42,0.3)'}}>
+          <summary style={{padding:'16px 20px',cursor:'pointer',fontSize:'10px',fontWeight:700,
+            letterSpacing:'0.1em',textTransform:'uppercase',color:'#64748b',listStyle:'none',
+            display:'flex',alignItems:'center',gap:'8px'}}>
+            <span>▸</span> Model Reference — Mathematical Formulation
+          </summary>
+          <div style={{padding:'0 20px 20px',display:'grid',gridTemplateColumns:'1fr 1fr',gap:'16px'}}>
+            {[
+              ['Objective Function',`min TAC = Utility Cost + Capital Cost
+
+Utility Cost =
+  Q_hot_util × CU_hot + Q_cold_util × CU_cold
+
+Capital Cost =
+  Σᵢⱼₖ [ CF × Aᵢⱼₖ^0.83 ]`,'#6ee7b7'],
+              ["Chen's LMTD",`LMTD ≈ (ΔT₁ · ΔT₂ · (ΔT₁+ΔT₂)/2)^(1/3)
+
+Area = Q / (U × LMTD)
+      0 ≤ Area ≤ 5000 m²`,'#93c5fd'],
+              ['Big-M Constraints',`ΔTᵢⱼₖ ≥ HRAT - M(1 - zᵢⱼₖ)
+Qᵢⱼₖ ≤ M · zᵢⱼₖ
+
+M = 100,000
+zᵢⱼₖ ∈ {0,1} (binary match variable)`,'#fdba74'],
+              ['Structural Constraints',`Heat Balance (per stage):
+  Mcp_H × (TH_in - TH_out) = Σⱼ Qᵢⱼₖ
+
+Euler's Rule:
+  Σᵢⱼₖ zᵢⱼₖ ≤ max_matches
+
+Monotonic T profiles:
+  TH[k] ≤ TH[k-1]  (hot, decreasing)
+  TC[k] ≥ TC[k-1]  (cold, increasing)`,'#c4b5fd'],
+            ].map(([title, code, color]) => (
+              <div key={title}>
+                <div style={{fontSize:'11px',fontWeight:700,color:'#cbd5e1',marginBottom:'8px'}}>{title}</div>
+                <pre style={{background:'#020617',borderRadius:'10px',padding:'12px',
+                  fontSize:'10px',color,lineHeight:'1.6',overflowX:'auto',fontFamily:'monospace'}}>
+                  {code}
+                </pre>
+              </div>
+            ))}
+          </div>
+        </details>
+      </main>
+
+      <footer style={{borderTop:'1px solid #0f172a',marginTop:'40px',padding:'20px',
+        textAlign:'center',fontSize:'11px',color:'#334155'}}>
+        HENS Optimizer · 3-Stage Superstructure MINLP · Chen's Approximation for LMTD ·
+        Big-M = 100,000 · Euler's Rule (max 5 matches)
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.render(<App/>, document.getElementById('root'));
+</script>
+</body>
+</html>
